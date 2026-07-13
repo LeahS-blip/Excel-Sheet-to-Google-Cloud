@@ -1,6 +1,6 @@
 # UPS Billing → BigQuery pipeline
 
-Loads Wine Country Connect's UPS "CODED" billing files from a Google Drive folder into a Google BigQuery database, automatically, every time a new period's file appears. One row per charge line (~64 columns), nothing aggregated, totals reconcile to the penny.
+Loads billing files from a Google Drive folder into a Google BigQuery database, automatically, every time a new period's file appears. One row per charge line (~64 columns), nothing aggregated, totals reconcile to the penny.
 
 ## How it works
 
