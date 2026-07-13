@@ -98,6 +98,9 @@ CSV_MIME = "text/csv"
 GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 JUNK_DATE_STRINGS = {"1/0/1900", "0/0/0000", "1/1/1900", "12/30/1899", "1899-12-30", "0"}
+# Broader pattern for junk dates with a literal zero day/month, e.g. "3/0/1900",
+# "0/5/2026" -- catches variants that don't exactly match JUNK_DATE_STRINGS above.
+_JUNK_DATE_RE = re.compile(r"^\d{1,2}/0/\d{2,4}$|^0/\d{1,2}/\d{2,4}$")
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +170,7 @@ def download_file(drive, file_meta):
 def _clean_column_name(name, seen):
     """BigQuery column names: letters, numbers, underscores, must start with a
     letter/underscore. Make each name safe and de-duplicate blanks/repeats."""
-    name = str(name).strip() if name is not None else ""
+    name = "" if pd.isna(name) else str(name).strip()
     name = re.sub(r"[^0-9a-zA-Z_]", "_", name).strip("_") or "column"
     if name[0].isdigit():
         name = f"_{name}"
@@ -202,7 +205,7 @@ def _try_date(series):
     """Return a column of datetime.date objects (junk/placeholder dates ->
     None), or None if this doesn't look like a date column."""
     cleaned = series.astype(str).str.strip()
-    junk_mask = cleaned.isin(JUNK_DATE_STRINGS)
+    junk_mask = cleaned.isin(JUNK_DATE_STRINGS) | cleaned.str.match(_JUNK_DATE_RE)
     parseable = cleaned.where(~junk_mask, None)
     parsed = pd.to_datetime(parseable, errors="coerce")
     non_null_original = series.notna().sum()
@@ -263,17 +266,23 @@ def parse_file(buf, file_meta, file_format):
             df[col] = date_col
         # else: leave as cleaned text
 
-    loaded_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    df["_source_file_id"] = file_meta["id"]
-    df["_source_file_name"] = file_name
-    df["_source_row_number"] = range(1, len(df) + 1)
-    df["_loaded_at"] = loaded_at
+    # Compute the content hash from the invoice data only, before adding any
+    # metadata columns below -- _loaded_at changes on every run, so including
+    # it (or anything added after this point) would make the hash different
+    # every time the same file is loaded, defeating its use as a stable
+    # dedup key.
     df["_row_hash"] = df.apply(
         lambda r: hashlib.sha256(
             (file_meta["id"] + "|" + "|".join(str(v) for v in r.values)).encode("utf-8")
         ).hexdigest(),
         axis=1,
     )
+
+    loaded_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    df["_source_file_id"] = file_meta["id"]
+    df["_source_file_name"] = file_name
+    df["_source_row_number"] = range(1, len(df) + 1)
+    df["_loaded_at"] = loaded_at
     return df
 
 
