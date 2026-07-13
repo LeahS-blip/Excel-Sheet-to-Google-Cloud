@@ -8,19 +8,20 @@ _load_log table so re-runs never double-load a file) but with the column
 mapping generalized: instead of a hard-coded 64-column schema for one specific
 invoice format, this version reads whatever columns are in the header row and
 lets BigQuery auto-detect the schema. Use this version when invoices come from
-different clients/vendors and don't all share one fixed column layout.
+different clients/vendors and don't all share one fixed column layout --
+including the UPS billing format, which this version can also handle.
 
-Only .csv files (and native Google Sheets, exported as CSV) are picked up.
+Supported file types: .csv, .xlsx, and native Google Sheets (exported as CSV).
 
 What it does, every time it runs:
-  1. Lists the CSV files (and native Google Sheets, exported as CSV) in one Google Drive folder.
+  1. Lists matching spreadsheet files in one Google Drive folder.
   2. Skips any file already loaded (tracked in the `_load_log` table), unless
      the file was modified in Drive since the last successful load.
   3. Downloads each new/changed file, finds the header row (see HEADER
      detection below), and reads every data row underneath it.
-  4. Appends the rows to a BigQuery table named after the source file's
-     spreadsheet (or a fixed table, if configured) -- schema is auto-detected
-     from the columns present, so it adapts to each client's invoice layout.
+  4. Cleans each column defensively (see DATA SAFETY below) and appends the
+     rows to a BigQuery table -- schema is auto-detected from the columns
+     present, so it adapts to each client's invoice layout.
   5. Records the result in `_load_log`.
 
 Runs two ways:
@@ -35,9 +36,27 @@ Header detection
 Most invoice exports either start the header on row 1, or have a short
 summary/preamble above the real header row. Set HEADER_ANCHOR to a value
 that always appears in the first cell of the true header row (e.g. a column
-name you know is always present, like "Invoice Number" or "Tracking Number").
-Leave HEADER_ANCHOR blank to just use row 1 as the header, which covers most
-straightforward exports.
+name you know is always present, like "Invoice Number" or, for UPS billing
+files, "WS Data Version"). Leave HEADER_ANCHOR blank to just use row 1 as
+the header, which covers most straightforward exports.
+
+--------------------------------------------------------------------------
+Data safety (why this is safe for codes/tracking numbers and dates too)
+--------------------------------------------------------------------------
+Unlike a naive auto-convert-everything approach, this loader applies two
+generic protections so it doesn't silently corrupt data:
+
+  * Leading-zero codes (account numbers, tracking numbers, postal codes)
+    are never auto-converted to numbers. Any column where at least one
+    value looks like "0" followed by another digit (e.g. "00000123") is
+    kept as text for every row, so leading zeros are never dropped.
+
+  * Junk placeholder dates (Excel's classic "1/0/1900", "0/0/0000", or any
+    parsed date with year <= 1900) are converted to NULL instead of being
+    loaded as garbage text or a bogus date.
+
+Columns that aren't caught by either rule are tried as numbers, then as
+dates, and otherwise loaded as text.
 --------------------------------------------------------------------------
 """
 
@@ -62,9 +81,10 @@ TABLE         = os.environ.get("BQ_TABLE", "invoice_line_items")
 LOG_TABLE     = os.environ.get("BQ_LOG_TABLE", "_load_log")
 DRIVE_FOLDER  = os.environ.get("DRIVE_FOLDER_ID", "")
 # Only load files whose name matches this (case-insensitive regex). Empty = all.
-FILE_NAME_REGEX = os.environ.get("FILE_NAME_REGEX", r"\.csv$")
+FILE_NAME_REGEX = os.environ.get("FILE_NAME_REGEX", r"\.(csv|xlsx)$")
 # First-cell value of the true header row, for files with a preamble above the
-# header. Leave blank to just treat row 1 as the header.
+# header (e.g. "WS Data Version" for UPS billing files). Leave blank to just
+# treat row 1 as the header.
 HEADER_ANCHOR = os.environ.get("HEADER_ANCHOR", "")
 # Optional path to a service-account key file. If unset, Application Default
 # Credentials are used (the normal case inside Cloud Functions / Cloud Run).
@@ -72,6 +92,12 @@ SA_KEY_FILE = os.environ.get("SERVICE_ACCOUNT_FILE")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly",
           "https://www.googleapis.com/auth/bigquery"]
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+CSV_MIME = "text/csv"
+GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+
+JUNK_DATE_STRINGS = {"1/0/1900", "0/0/0000", "1/1/1900", "12/30/1899", "1899-12-30", "0"}
 
 
 # --------------------------------------------------------------------------- #
@@ -87,10 +113,7 @@ def _credentials():
 # --------------------------------------------------------------------------- #
 # Drive                                                                       #
 # --------------------------------------------------------------------------- #
-SPREADSHEET_MIME_TYPES = [
-    "text/csv",
-    "application/vnd.google-apps.spreadsheet",  # native Google Sheet, exported below as CSV
-]
+SPREADSHEET_MIME_TYPES = [CSV_MIME, XLSX_MIME, GOOGLE_SHEET_MIME]
 
 
 def list_drive_files(drive):
@@ -104,7 +127,9 @@ def list_drive_files(drive):
             pageSize=200, pageToken=token,
             supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
         for f in resp.get("files", []):
-            if pat is None or pat.search(f["name"]):
+            # Native Google Sheets don't have a file extension, so the name
+            # regex doesn't apply to them -- always include those.
+            if f["mimeType"] == GOOGLE_SHEET_MIME or pat is None or pat.search(f["name"]):
                 files.append(f)
         token = resp.get("nextPageToken")
         if not token:
@@ -113,19 +138,27 @@ def list_drive_files(drive):
 
 
 def download_file(drive, file_meta):
+    """Returns (buf, file_format) where file_format is 'csv' or 'xlsx'."""
     file_id = file_meta["id"]
-    if file_meta["mimeType"] == "application/vnd.google-apps.spreadsheet":
-        # Native Google Sheet -> export as CSV
-        request = drive.files().export_media(fileId=file_id, mimeType="text/csv")
+    mime = file_meta["mimeType"]
+
+    if mime == GOOGLE_SHEET_MIME:
+        request = drive.files().export_media(fileId=file_id, mimeType=CSV_MIME)
+        file_format = "csv"
+    elif mime == XLSX_MIME:
+        request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+        file_format = "xlsx"
     else:
         request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+        file_format = "csv"
+
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
     buf.seek(0)
-    return buf
+    return buf, file_format
 
 
 # --------------------------------------------------------------------------- #
@@ -146,9 +179,53 @@ def _clean_column_name(name, seen):
     return name
 
 
-def parse_file(buf, file_meta):
+_LEADING_ZERO_RE = re.compile(r"^0\d")
+
+
+def _has_leading_zero_code(series):
+    """True if any value in this column looks like a code with a leading zero
+    (e.g. '00000123', '0000009A516V216') -- these must never become numbers."""
+    return series.dropna().astype(str).str.strip().str.match(_LEADING_ZERO_RE).any()
+
+
+def _try_numeric(series):
+    """Return a converted numeric series, or None if any non-null value fails
+    to convert (so a column is only switched to numeric when it's safe)."""
+    cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
+    converted = pd.to_numeric(cleaned, errors="coerce")
+    if converted.notna().sum() == series.notna().sum() and series.notna().any():
+        return converted
+    return None
+
+
+def _try_date(series):
+    """Return a column of datetime.date objects (junk/placeholder dates ->
+    None), or None if this doesn't look like a date column."""
+    cleaned = series.astype(str).str.strip()
+    junk_mask = cleaned.isin(JUNK_DATE_STRINGS)
+    parseable = cleaned.where(~junk_mask, None)
+    parsed = pd.to_datetime(parseable, errors="coerce")
+    non_null_original = series.notna().sum()
+    if non_null_original == 0:
+        return None
+    # A junk placeholder is a *recognized* date-shaped value (just one we null
+    # out on purpose), so it counts as a success -- otherwise files with a lot
+    # of legitimate junk dates would never get detected as date columns at all.
+    success_ratio = (parsed.notna().sum() + junk_mask.sum()) / non_null_original
+    if success_ratio < 0.9:
+        return None  # not consistently date-like -- leave it as text
+    # Placeholder/junk years (e.g. Excel's 1899/1900 zero-date) -> NULL
+    parsed = parsed.where(parsed.dt.year > 1900)
+    return parsed.dt.date
+
+
+def parse_file(buf, file_meta, file_format):
     file_name = file_meta["name"]
-    raw_df = pd.read_csv(buf, header=None, dtype=str)
+
+    if file_format == "xlsx":
+        raw_df = pd.read_excel(buf, header=None, dtype=str, engine="openpyxl")
+    else:
+        raw_df = pd.read_csv(buf, header=None, dtype=str)
 
     header_row_idx = 0
     if HEADER_ANCHOR:
@@ -171,15 +248,20 @@ def parse_file(buf, file_meta):
     if HEADER_ANCHOR and columns:
         df = df[df[columns[0]].astype(str).str.strip() != HEADER_ANCHOR]
 
-    # Best-effort numeric conversion: try each column as numeric, keep as text if it fails
+    # Normalize blank cells to real nulls before any type inference
+    df = df.apply(lambda col: col.where(col.astype(str).str.strip() != "", None))
+
     for col in df.columns:
-        converted = pd.to_numeric(
-            df[col].astype(str).str.replace(",", "").str.replace("$", "", regex=False),
-            errors="coerce",
-        )
-        # Only switch to numeric if every non-null cell converted successfully
-        if converted.notna().sum() == df[col].notna().sum() and df[col].notna().any():
-            df[col] = converted
+        if _has_leading_zero_code(df[col]):
+            continue  # protected: always stays text
+        numeric = _try_numeric(df[col])
+        if numeric is not None:
+            df[col] = numeric
+            continue
+        date_col = _try_date(df[col])
+        if date_col is not None:
+            df[col] = date_col
+        # else: leave as cleaned text
 
     loaded_at = dt.datetime.now(dt.timezone.utc).isoformat()
     df["_source_file_id"] = file_meta["id"]
@@ -269,8 +351,8 @@ def load_new_files():
             summary.append(f"SKIP  {f['name']} (already loaded)")
             continue
         try:
-            buf = download_file(drive, f)
-            df = parse_file(buf, f)
+            buf, file_format = download_file(drive, f)
+            df = parse_file(buf, f, file_format)
             n = append_rows(bq, df) if len(df) else 0
             log_load(bq, f, n, "success")
             summary.append(f"LOAD  {f['name']}: {n} rows")
