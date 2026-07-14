@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy this file to config.json and fill in your own values.",
+
+  "gcp_project_id": "your-gcp-project-id",
+
+  "local_watch_folder": "C:/Users/YourName/Invoices",
+  "filename_keyword_filter": "",
+
+  "header_anchor": "",
+
+  "gcs_bucket_name": "",
+  "gcs_prefix": "invoices",
+
+  "bigquery": {
+    "dataset": "invoices",
+    "table": "invoice_line_items"
+  }
+}
