@@ -142,18 +142,18 @@ gcloud functions deploy invoice-loader \
 (No `SERVICE_ACCOUNT_FILE` here — running as the service account, the function authenticates automatically. Add `HEADER_ANCHOR=...` to `--set-env-vars` if you set one during testing.)
 
 ### Schedule it
-Run every hour or two so invoices don't sit for long before showing up in BigQuery; adjust to taste.
+Runs once a day at 7am; adjust to taste.
 
 ```bash
 FUNCTION_URL=$(gcloud functions describe invoice-loader --gen2 --region=us-central1 --format='value(serviceConfig.uri)')
 
-gcloud scheduler jobs create http invoice-loader-hourly \
-  --location=us-central1 --schedule="0 * * * *" \
+gcloud scheduler jobs create http invoice-loader-daily \
+  --location=us-central1 --schedule="0 7 * * *" \
   --uri="$FUNCTION_URL" --http-method=POST \
   --oidc-service-account-email=invoice-loader@invoice-pipeline-433xxx.iam.gserviceaccount.com
 ```
 
-Done. Drop a new invoice file into the Drive folder (or let Google Drive for Desktop sync it there automatically) and it lands in BigQuery within the hour — or trigger immediately with `gcloud scheduler jobs run invoice-loader-hourly`.
+Done. Drop a new invoice file into the Drive folder (or let Google Drive for Desktop sync it there automatically) and it lands in BigQuery by the next morning — or trigger immediately with `gcloud scheduler jobs run invoice-loader-daily`.
 
 ---
 

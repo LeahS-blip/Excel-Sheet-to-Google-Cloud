@@ -14,7 +14,7 @@ Picks up `.csv` and `.xlsx` files.
 ## How it works
 
 ```
-Windows folder (File Explorer)     Task Scheduler (e.g. every 15 min)
+Windows folder (File Explorer)     Task Scheduler (e.g. daily 7am)
   client-a-invoice.csv                    │ triggers
   client-b-invoice.xlsx                   ▼
   client-c-invoice.csv      ──▶   main.py
@@ -114,13 +114,13 @@ Skip this if you only want data in BigQuery, not a raw-file backup.
 ### Windows Task Scheduler
 1. Open Task Scheduler → **Create Task**.
 2. General tab: name it "Invoice Loader," check **Run whether user is logged on or not**.
-3. Triggers tab: New → Daily, recurring, then check **Repeat task every 15 minutes for a duration of 1 day**.
+3. Triggers tab: New → Daily, recurring, set a time the computer is usually on (e.g. 7:00 AM).
 4. Actions tab: New → Start a program. Program: path to `python.exe`. Arguments: full path to `main.py`. Start in: the script's folder.
-5. Save. It'll now check the folder every 15 minutes, even if nobody's watching.
+5. Save. It'll now check the folder once a day, even if nobody's watching.
 
 ### Mac/Linux (cron)
 ```bash
-*/15 * * * * cd /path/to/loader && /usr/bin/python3 main.py
+0 7 * * * cd /path/to/loader && /usr/bin/python3 main.py
 ```
 
 ---
